@@ -11,14 +11,21 @@ Interactive display controls with --display:
   r       : reset current cube
   p       : pause / resume
   h       : print controls
+
+Browser display with --web-display:
+  Open http://127.0.0.1:8765/ from Windows. This avoids cv2.imshow and is
+  the recommended mode for demos on WSL / Windows PCs.
 """
 
 import argparse
+import http.server
 import json
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import imageio.v2 as imageio
 import numpy as np
@@ -66,6 +73,151 @@ DEFAULT_COLORS = [
     ("green", np.array([0.05, 0.65, 0.25, 1.0], dtype=np.float64)),
     ("yellow", np.array([0.95, 0.72, 0.12, 1.0], dtype=np.float64)),
 ]
+
+
+WEB_PAGE = """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>JAKA BC-MLP continuous demo</title>
+  <style>
+    html, body { margin: 0; min-height: 100%; background: #111; color: #eee; font-family: Arial, sans-serif; }
+    .bar { display: flex; gap: 10px; align-items: center; padding: 10px 14px; background: #202020; position: sticky; top: 0; z-index: 2; }
+    button { font-size: 15px; padding: 7px 12px; border: 1px solid #666; background: #333; color: #fff; border-radius: 4px; cursor: pointer; }
+    button:hover { background: #444; }
+    .hint { margin-left: 8px; color: #bbb; font-size: 14px; }
+    .stage { display: flex; justify-content: center; padding: 14px; }
+    img { max-width: calc(100vw - 28px); max-height: calc(100vh - 76px); object-fit: contain; background: #000; }
+  </style>
+</head>
+<body>
+  <div class="bar">
+    <strong>JAKA BC-MLP continuous demo</strong>
+    <button onclick="cmd('pause')">Pause / Resume</button>
+    <button onclick="cmd('next')">Next cube</button>
+    <button onclick="cmd('reset')">Reset</button>
+    <button onclick="cmd('quit')">Quit</button>
+    <span class="hint">Keyboard: p pause, n next, r reset, q quit</span>
+  </div>
+  <div class="stage"><img src="/stream" /></div>
+  <script>
+    function cmd(name) { fetch('/cmd?name=' + encodeURIComponent(name)).catch(() => {}); }
+    document.addEventListener('keydown', (ev) => {
+      const k = ev.key.toLowerCase();
+      if (k === 'p') cmd('pause');
+      if (k === 'n') cmd('next');
+      if (k === 'r') cmd('reset');
+      if (k === 'q' || ev.key === 'Escape') cmd('quit');
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+class WebDisplayServer:
+    def __init__(self, host, port, jpeg_quality=85):
+        self.host = host
+        self.port = int(port)
+        self.jpeg_quality = int(jpeg_quality)
+        self.latest_jpeg = None
+        self.command = None
+        self.lock = threading.Lock()
+        self.condition = threading.Condition(self.lock)
+        self.httpd = None
+        self.thread = None
+
+    def start(self):
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, _fmt, *_args):
+                return
+
+            def do_GET(self):
+                parsed = urlparse(self.path)
+                if parsed.path in ("/", "/index.html"):
+                    body = WEB_PAGE.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if parsed.path == "/cmd":
+                    name = parse_qs(parsed.query).get("name", [""])[0]
+                    if name in {"pause", "next", "reset", "quit"}:
+                        outer.set_command(name)
+                    body = b"ok\n"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if parsed.path == "/stream":
+                    self.send_response(200)
+                    self.send_header("Age", "0")
+                    self.send_header("Cache-Control", "no-cache, private")
+                    self.send_header("Pragma", "no-cache")
+                    self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                    self.end_headers()
+                    last = None
+                    while True:
+                        with outer.condition:
+                            outer.condition.wait(timeout=1.0)
+                            frame = outer.latest_jpeg
+                        if frame is None or frame is last:
+                            continue
+                        last = frame
+                        try:
+                            self.wfile.write(b"--frame\r\n")
+                            self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                            self.wfile.write(f"Content-Length: {len(frame)}\r\n\r\n".encode("ascii"))
+                            self.wfile.write(frame)
+                            self.wfile.write(b"\r\n")
+                        except (BrokenPipeError, ConnectionResetError):
+                            break
+                    return
+                self.send_error(404)
+
+        self.httpd = http.server.ThreadingHTTPServer((self.host, self.port), Handler)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        actual_host, actual_port = self.httpd.server_address
+        print(f"web_display=http://127.0.0.1:{actual_port}/")
+        if actual_host not in ("127.0.0.1", "localhost"):
+            print(f"web_display_bound=http://{actual_host}:{actual_port}/")
+
+    def stop(self):
+        if self.httpd is not None:
+            self.httpd.shutdown()
+            self.httpd.server_close()
+
+    def set_command(self, command):
+        with self.lock:
+            self.command = command
+            self.condition.notify_all()
+
+    def pop_command(self):
+        with self.lock:
+            command = self.command
+            self.command = None
+            return command
+
+    def update_frame(self, rgb, bgr=None):
+        try:
+            import cv2
+        except Exception as exc:
+            raise RuntimeError("--web-display requires OpenCV for JPEG encoding") from exc
+        if bgr is None:
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        ok, encoded = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
+        if not ok:
+            return
+        with self.condition:
+            self.latest_jpeg = encoded.tobytes()
+            self.condition.notify_all()
 
 
 @dataclass
@@ -408,8 +560,12 @@ def run_demo(args):
     scenarios = load_scenarios(args.scenario_file, args) if args.scenario_file else []
     rng = np.random.default_rng(args.seed)
     runtime = load_runtime(args.policy, args.device)
+    web_server = None
+    if args.web_display:
+        web_server = WebDisplayServer(args.web_host, args.web_port, jpeg_quality=args.web_jpeg_quality)
+        web_server.start()
 
-    needs_render = args.display or args.record_dir is not None
+    needs_render = args.display or args.web_display or args.record_dir is not None
     env = make_env(has_offscreen_renderer=needs_render)
     env.reset()
     base_body_id, _base_name = find_body_id(env, "jaka_base")
@@ -438,6 +594,8 @@ def run_demo(args):
         cv2 = None
         if args.display:
             raise RuntimeError("--display requires OpenCV with GUI support")
+        if args.web_display:
+            raise RuntimeError("--web-display requires OpenCV for JPEG encoding")
 
     while not quit_requested and (args.num_runs <= 0 or completed < args.num_runs):
         scenario = sample_scenario(args, rng, episode_idx, scenarios)
@@ -465,6 +623,20 @@ def run_demo(args):
         while step < horizon and not quit_requested:
             loop_start = time.perf_counter()
             if paused:
+                command = web_server.pop_command() if web_server is not None else None
+                if command == "quit":
+                    quit_requested = True
+                elif command == "pause":
+                    paused = False
+                elif command == "next":
+                    reset_current = False
+                    break
+                elif command == "reset":
+                    reset_current = True
+                    break
+                if args.web_display and needs_render:
+                    _rgb, _bgr = render_frame(env, args, ["PAUSED", "p resume | n next | r reset | q quit"])
+                    web_server.update_frame(_rgb, _bgr)
                 if args.display and cv2 is not None:
                     _rgb, bgr = render_frame(env, args, ["PAUSED", "q quit | p resume | n next | r reset"])
                     cv2.imshow(args.window_name, bgr)
@@ -527,6 +699,18 @@ def run_demo(args):
                 rgb, bgr = render_frame(env, args, status)
                 if writer is not None:
                     writer.append_data(rgb)
+                if args.web_display and web_server is not None:
+                    web_server.update_frame(rgb, bgr)
+                    command = web_server.pop_command()
+                    if command == "quit":
+                        quit_requested = True
+                    elif command == "next":
+                        break
+                    elif command == "reset":
+                        reset_current = True
+                        break
+                    elif command == "pause":
+                        paused = True
                 if args.display and cv2 is not None:
                     cv2.imshow(args.window_name, bgr)
                     key = cv2.waitKey(1) & 0xFF
@@ -547,7 +731,7 @@ def run_demo(args):
                 if success_hold >= args.success_hold_steps:
                     break
 
-            if args.real_time or args.display:
+            if args.real_time or args.display or args.web_display:
                 elapsed = time.perf_counter() - loop_start
                 sleep_s = max(0.0, (1.0 / args.control_freq) - elapsed)
                 if sleep_s > 0:
@@ -577,6 +761,8 @@ def run_demo(args):
 
     if args.display and cv2 is not None:
         cv2.destroyAllWindows()
+    if web_server is not None:
+        web_server.stop()
     print(f"finished episodes_started={episode_idx} successes={completed}")
 
 
@@ -623,6 +809,10 @@ def main():
     parser.add_argument("--control-freq", type=float, default=20.0)
     parser.add_argument("--real-time", action="store_true")
     parser.add_argument("--display", action="store_true")
+    parser.add_argument("--web-display", action="store_true", help="Show the rollout as an MJPEG stream in a browser")
+    parser.add_argument("--web-host", default="127.0.0.1")
+    parser.add_argument("--web-port", type=int, default=8765)
+    parser.add_argument("--web-jpeg-quality", type=int, default=85)
     parser.add_argument("--window-name", default="JAKA continuous BC-MLP policy demo")
     parser.add_argument("--record-dir", default=None)
     parser.add_argument("--video-camera", default="frontview")
